@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/* ------------------------------------------------------------
-   ========== Minimal Interfaces & Libraries ==========
-   (Tanpa dependensi eksternal; ringkas namun aman)
--------------------------------------------------------------*/
 
 interface IERC20 {
     function totalSupply() external view returns (uint256);
