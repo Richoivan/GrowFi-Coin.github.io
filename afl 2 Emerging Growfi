@@ -1,0 +1,779 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/* ------------------------------------------------------------
+   ========== Minimal Interfaces & Libraries ==========
+   (Tanpa dependensi eksternal; ringkas namun aman)
+-------------------------------------------------------------*/
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address a) external view returns (uint256);
+    function transfer(address to, uint256 amt) external returns (bool);
+    function transferFrom(address f, address t, uint256 amt) external returns (bool);
+    function approve(address s, uint256 amt) external returns (bool);
+    function allowance(address o, address s) external view returns (uint256);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+/// @dev util transfer aman utk ETH/ERC20 (tanpa reentrancy guard di sini demi ringkas).
+library SafeTransferLib {
+    error SafeTransferFailed();
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert SafeTransferFailed();
+    }
+
+    function safeTransfer(IERC20 token, address to, uint256 amount) internal {
+        bool ok = token.transfer(to, amount);
+        if (!ok) revert SafeTransferFailed();
+    }
+
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 amount) internal {
+        bool ok = token.transferFrom(from, to, amount);
+        if (!ok) revert SafeTransferFailed();
+    }
+}
+
+/* ------------------------------------------------------------
+   ========== Ownable / Access Base ==========
+-------------------------------------------------------------*/
+
+abstract contract Ownable {
+    address public owner;
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert Unauthorized();
+        _;
+    }
+
+    constructor() { owner = msg.sender; }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "zero addr");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+    error Unauthorized();
+}
+
+/* ------------------------------------------------------------
+   ========== Mock GFI Token (ERC20 sederhana) ==========
+   - Dipakai untuk governance & fee.
+-------------------------------------------------------------*/
+contract GFIToken is IERC20, Ownable {
+    string public constant name = "GrowFi";
+    string public constant symbol = "GFI";
+    uint8  public constant decimals = 18;
+    uint256 private _totalSupply;
+
+    mapping(address => uint256) private _bal;
+    mapping(address => mapping(address => uint256)) private _alw;
+
+    function totalSupply() external view override returns (uint256) { return _totalSupply; }
+    function balanceOf(address a) external view override returns (uint256) { return _bal[a]; }
+    function allowance(address o, address s) external view override returns (uint256) { return _alw[o][s]; }
+
+    function transfer(address to, uint256 amt) external override returns (bool) {
+        _transfer(msg.sender, to, amt); return true;
+    }
+    function approve(address s, uint256 amt) external override returns (bool) {
+        _alw[msg.sender][s] = amt; emit Approval(msg.sender, s, amt); return true;
+    }
+    function transferFrom(address f, address t, uint256 amt) external override returns (bool) {
+        uint256 a = _alw[f][msg.sender]; require(a >= amt, "allow");
+        _alw[f][msg.sender] = a - amt; _transfer(f, t, amt); return true;
+    }
+
+    function _transfer(address f, address t, uint256 amt) internal {
+        require(t != address(0),"zero");
+        uint256 b = _bal[f]; require(b >= amt, "bal");
+        unchecked { _bal[f] = b - amt; }
+        _bal[t] += amt;
+        emit Transfer(f,t,amt);
+    }
+
+    function mint(address to, uint256 amt) external onlyOwner {
+        _totalSupply += amt; _bal[to] += amt; emit Transfer(address(0), to, amt);
+    }
+}
+
+/* ------------------------------------------------------------
+   ========== Interfaces untuk kolaborasi antar-kontrak ==========
+-------------------------------------------------------------*/
+interface ICollateralVault {
+    enum CollateralStatus { None, Locked, Released, Liquidated }
+
+    struct Collateral {
+        address borrower;
+        address token;   // address(0) = ETH, selainnya ERC20
+        uint256 amount;
+        CollateralStatus status;
+        bytes32 projectId; // referensi project/loan
+    }
+
+    function lockCollateral(bytes32 projectId, address borrower, address token, uint256 amount) external payable;
+    function releaseCollateral(bytes32 projectId, address to) external;
+    function liquidateCollateral(bytes32 projectId, address beneficiary) external;
+    function getCollateral(bytes32 projectId) external view returns (Collateral memory);
+}
+
+interface IInvestmentContract {
+    function isDefaulted(bytes32 projectId) external view returns (bool);
+}
+
+/* ------------------------------------------------------------
+   ========== CollateralVault ==========
+   - Wajib lock collateral (ETH/ERC20)
+   - Hanya kontrak ter-otorisasi yg bisa release/liquidate
+-------------------------------------------------------------*/
+contract CollateralVault is ICollateralVault, Ownable {
+    using SafeTransferLib for IERC20;
+    using SafeTransferLib for address;
+
+    // Constants
+    uint256 public constant VERSION = 1;
+
+    // Immutables
+    address public immutable investmentContract;
+
+    // State
+    mapping(bytes32 => Collateral) private _collateralByProject;
+    mapping(address => bool) public authorized; // kontrak lain (mis: Investment) yang boleh manage
+
+    // Events
+    event CollateralLocked(bytes32 indexed projectId, address indexed borrower, address token, uint256 amount);
+    event CollateralReleased(bytes32 indexed projectId, address indexed to);
+    event CollateralLiquidated(bytes32 indexed projectId, address indexed to);
+
+    // Errors
+    error AlreadyLocked();
+    error NotAuthorized();
+    error InvalidState();
+    error InvalidAmount();
+
+    constructor(address _investmentContract) {
+        require(_investmentContract != address(0), "inv");
+        investmentContract = _investmentContract;
+        authorized[_investmentContract] = true;
+    }
+
+    modifier onlyAuth() {
+        if (!authorized[msg.sender]) revert NotAuthorized();
+        _;
+    }
+
+    function setAuthorized(address a, bool v) external onlyOwner {
+        authorized[a] = v;
+    }
+
+    function lockCollateral(bytes32 projectId, address borrower, address token, uint256 amount) external payable override onlyAuth {
+        Collateral storage c = _collateralByProject[projectId];
+        if (c.status != CollateralStatus.None) revert AlreadyLocked();
+
+        if (token == address(0)) {
+            // ETH collateral
+            if (msg.value == 0) revert InvalidAmount();
+            amount = msg.value;
+        } else {
+            if (amount == 0) revert InvalidAmount();
+            IERC20(token).safeTransferFrom(borrower, address(this), amount);
+        }
+
+        _collateralByProject[projectId] = Collateral({
+            borrower: borrower,
+            token: token,
+            amount: amount,
+            status: CollateralStatus.Locked,
+            projectId: projectId
+        });
+
+        emit CollateralLocked(projectId, borrower, token, amount);
+    }
+
+    function releaseCollateral(bytes32 projectId, address to) external override onlyAuth {
+        Collateral storage c = _collateralByProject[projectId];
+        if (c.status != CollateralStatus.Locked) revert InvalidState();
+        c.status = CollateralStatus.Released;
+
+        if (c.token == address(0)) {
+            SafeTransferLib.safeTransferETH(to, c.amount);
+        } else {
+            SafeTransferLib.safeTransfer(IERC20(c.token), to, c.amount);
+        }
+        emit CollateralReleased(projectId, to);
+    }
+
+    function liquidateCollateral(bytes32 projectId, address beneficiary) external override onlyAuth {
+        Collateral storage c = _collateralByProject[projectId];
+        if (c.status != CollateralStatus.Locked) revert InvalidState();
+        c.status = CollateralStatus.Liquidated;
+
+        if (c.token == address(0)) {
+            SafeTransferLib.safeTransferETH(beneficiary, c.amount);
+        } else {
+            SafeTransferLib.safeTransfer(IERC20(c.token), beneficiary, c.amount);
+        }
+        emit CollateralLiquidated(projectId, beneficiary);
+    }
+
+    function getCollateral(bytes32 projectId) external view override returns (Collateral memory) {
+        return _collateralByProject[projectId];
+    }
+}
+
+/* ------------------------------------------------------------
+   ========== InvestmentContract (Lending Model) ==========
+   - Investor invest (ETH), UMKM repay, investor claim interest
+   - Auto-liquidation via CollateralVault bila default
+-------------------------------------------------------------*/
+contract InvestmentContract is Ownable, IInvestmentContract {
+    using SafeTransferLib for address;
+
+    // ====== Types ======
+    enum ProjectState { None, Active, Repaid, Defaulted }
+    struct InvestorInfo { address investor; uint256 amount; bool claimed; }
+    struct Project {
+        bytes32 id;
+        address borrower;
+        uint256 principal;
+        uint256 interestBps; // bunga tetap dalam basis points (ex: 1200 = 12%)
+        uint256 startAt;     // timestamp
+        uint256 duration;    // detik
+        uint256 totalInvested;
+        uint256 totalRepaid;
+        ProjectState state;
+        address feeToken;    // address(0) => fee in ETH (disederhanakan)
+        InvestorInfo[] investors;
+        mapping(address => uint256) investedOf;
+    }
+
+    // ====== Constants / Immutables ======
+    uint256 public constant MAX_BPS = 10_000;
+    uint256 public constant VERSION = 1;
+    uint256 public immutable SERVICE_FEE_BPS;     // biaya layanan (misal 20 = 0.2%)
+    address public immutable DAO_TREASURY;        // penerima fee
+
+    // ====== State Variables ======
+    mapping(bytes32 => Project) private _projects;
+    bytes32[] private _projectIndex;
+    address public collateralVault;
+    GFIToken public gfi; // untuk contoh governance fee payment (tidak dipakai luas pada kontrak ini)
+
+    // ====== Events ======
+    event ProjectCreated(bytes32 indexed id, address indexed borrower, uint256 principal, uint256 interestBps, uint256 duration);
+    event Invested(bytes32 indexed id, address indexed investor, uint256 amount);
+    event Repaid(bytes32 indexed id, address indexed borrower, uint256 amount);
+    event Claimed(bytes32 indexed id, address indexed investor, uint256 principal, uint256 interest);
+    event DefaultTriggered(bytes32 indexed id);
+    event CollateralLiquidationAttempt(bytes32 indexed id, bool success);
+
+    // ====== Custom Errors ======
+    error ProjectExists();
+    error ProjectNotFound();
+    error ProjectInactive();
+    error InvalidAmount();
+    error TooEarly();
+    error AlreadyClaimed();
+
+    // ====== Modifiers ======
+    modifier projectExists(bytes32 id) {
+        if (_projects[id].state == ProjectState.None) revert ProjectNotFound();
+        _;
+    }
+    modifier onlyActive(bytes32 id) {
+        if (_projects[id].state != ProjectState.Active) revert ProjectInactive();
+        _;
+    }
+
+    constructor(address _vault, address _daoTreasury, uint256 _feeBps, address _gfi) {
+        // OLD: require(_vault != address(0) && _daoTreasury != address(0), "zero");
+        require(_daoTreasury != address(0), "zero");   // allow _vault = 0x0; we’ll set later
+
+        require(_feeBps <= 200, "fee>0.2% sample"); // contoh guard
+        collateralVault = _vault;
+        DAO_TREASURY = _daoTreasury;
+        SERVICE_FEE_BPS = _feeBps;
+        gfi = GFIToken(_gfi);
+    }
+
+    // ====== Pure/View Helpers ======
+    function calcInterest(uint256 principal, uint256 bps) public pure returns (uint256) {
+        // Pure: tak membaca state
+        // bunga sederhana untuk contoh
+        return (principal * bps) / MAX_BPS;
+    }
+
+    function isDefaulted(bytes32 id) public view override returns (bool) {
+        Project storage p = _projects[id];
+        if (p.state != ProjectState.Active) return false;
+        bool late = block.timestamp > (p.startAt + p.duration) && p.totalRepaid < (p.principal + calcInterest(p.principal, p.interestBps));
+        return late;
+    }
+
+    // ====== Getters / Setters ======
+    function getProject(bytes32 id) external view projectExists(id) returns (
+        address borrower, uint256 principal, uint256 interestBps, uint256 startAt, uint256 duration,
+        uint256 totalInvested, uint256 totalRepaid, ProjectState state, uint256 investorCount
+    ) {
+        Project storage p = _projects[id];
+        return (p.borrower, p.principal, p.interestBps, p.startAt, p.duration,
+                p.totalInvested, p.totalRepaid, p.state, p.investors.length);
+    }
+
+    function projectCount() external view returns (uint256) { return _projectIndex.length; }
+
+    function setCollateralVault(address v) external onlyOwner {
+        require(v != address(0), "zero");
+        collateralVault = v;
+    }
+
+    // ====== Core Flow ======
+
+    /// @dev UMKM mendaftarkan proyek (principal adalah target)
+    function createProject(
+        bytes32 id,
+        uint256 principal,
+        uint256 interestBps,
+        uint256 duration,
+        address borrower
+    ) external onlyOwner {
+        if (_projects[id].state != ProjectState.None) revert ProjectExists();
+        require(borrower != address(0) && principal > 0 && interestBps < MAX_BPS && duration > 0, "arg");
+        Project storage p = _projects[id];
+        p.id = id;
+        p.borrower = borrower;
+        p.principal = principal;
+        p.interestBps = interestBps;
+        p.duration = duration;
+        p.startAt = block.timestamp; // global variable sample
+        p.state = ProjectState.Active;
+        _projectIndex.push(id);
+
+        emit ProjectCreated(id, borrower, principal, interestBps, duration);
+    }
+
+    /// @dev Investor berinvestasi dalam ETH. Fee diambil kecil utk DAO.
+    function invest(bytes32 id) external payable projectExists(id) onlyActive(id) {
+        if (msg.value == 0) revert InvalidAmount();
+
+        Project storage p = _projects[id];
+
+        // fee layanan sederhana
+        uint256 fee = (msg.value * SERVICE_FEE_BPS) / MAX_BPS;
+        uint256 net = msg.value - fee;
+        assert(net + fee == msg.value); // contoh assert utk invariant aritmatika
+
+        // log investasi
+        p.totalInvested += net;
+        p.investors.push(InvestorInfo({investor: msg.sender, amount: net, claimed: false}));
+        p.investedOf[msg.sender] += net;
+
+        // kirim fee ke treasury DAO
+        SafeTransferLib.safeTransferETH(DAO_TREASURY, fee);
+
+        emit Invested(id, msg.sender, net);
+    }
+
+    /// @dev UMKM membayar kembali (pokok + bunga) secara bertahap atau sekaligus.
+    function repay(bytes32 id) external payable projectExists(id) onlyActive(id) {
+        Project storage p = _projects[id];
+        require(msg.sender == p.borrower, "borrower");
+
+        if (msg.value == 0) revert InvalidAmount();
+        p.totalRepaid += msg.value;
+        emit Repaid(id, msg.sender, msg.value);
+
+        uint256 totalDue = p.principal + calcInterest(p.principal, p.interestBps);
+        if (p.totalRepaid >= totalDue) {
+            p.state = ProjectState.Repaid;
+            // collateral release diserahkan ke owner/automasi eksternal setelah aman
+        }
+    }
+
+    /// @dev Investor mengklaim pokok+interest secara proporsional bila sudah repaid penuh
+    function claim(bytes32 id) external projectExists(id) {
+        Project storage p = _projects[id];
+        require(p.state == ProjectState.Repaid, "not repaid");
+
+        uint256 invested = p.investedOf[msg.sender];
+        require(invested > 0, "no invest");
+
+        // cari indeks investor & status claimed
+        uint256 len = p.investors.length;
+        bool found;
+        for (uint256 i = 0; i < len; i++) {
+            if (p.investors[i].investor == msg.sender) {
+                if (p.investors[i].claimed) revert AlreadyClaimed();
+                p.investors[i].claimed = true;
+                found = true;
+                break;
+            }
+        }
+        require(found, "not found");
+
+        uint256 totalDue = p.principal + calcInterest(p.principal, p.interestBps);
+        // pro-rata berdasarkan totalInvested
+        uint256 amountOut = (totalDue * invested) / p.totalInvested;
+        // set state local var (contoh local variable)
+        uint256 toSend = amountOut;
+
+        // transfer ETH
+        SafeTransferLib.safeTransferETH(msg.sender, toSend);
+        emit Claimed(id, msg.sender, invested, amountOut - invested);
+    }
+
+    /// @dev Trigger default dan mencoba likuidasi collateral via try/catch
+    function triggerDefaultAndLiquidate(bytes32 id) external projectExists(id) onlyActive(id) {
+        Project storage p = _projects[id];
+        require(isDefaulted(id), "not default");
+
+        p.state = ProjectState.Defaulted;
+        emit DefaultTriggered(id);
+
+        // coba likuidasi collateral ke kontrak ini (untuk distribusi sesuai kebijakan)
+        try ICollateralVault(collateralVault).liquidateCollateral(id, address(this)) {
+            emit CollateralLiquidationAttempt(id, true);
+        } catch {
+            emit CollateralLiquidationAttempt(id, false);
+            // revert tidak dipilih agar tetap tercatat default meskipun likuidasi gagal
+        }
+    }
+
+    // ====== Utility: saldo kontrak untuk emergency distribusi (hanya contoh) ======
+    function contractBalance() external view returns (uint256) { return address(this).balance; }
+
+    // fallback/receive
+    receive() external payable {}
+}
+
+/* ------------------------------------------------------------
+   ========== ProfitSharing (Equity Fractional) ==========
+   - Investor subscribe ekuitas (ETH), mendapat unit
+   - UMKM lapor profit, investor klaim dividen pro-rata
+-------------------------------------------------------------*/
+contract ProfitSharing is Ownable {
+    using SafeTransferLib for address;
+
+    // Types
+    struct Holder { uint256 units; uint256 lastClaimedEpoch; }
+    enum PoolState { Inactive, Active, Closed }
+
+    // State
+    bytes32 public poolId;
+    address public issuer; // UMKM
+    uint256 public unitPriceWei; // harga 1 unit
+    uint256 public totalUnitsSold;
+    uint256 public totalProfitReported;
+    uint256 public currentEpoch; // bertambah saat report profit
+    PoolState public state;
+
+    mapping(address => Holder) public holders;
+    mapping(uint256 => uint256) public profitAtEpoch; // epoch => profit
+
+    // Events
+    event Subscribed(address indexed investor, uint256 units, uint256 paid);
+    event ProfitReported(uint256 indexed epoch, uint256 amount);
+    event DividendClaimed(address indexed investor, uint256 total);
+
+    // Errors
+    error NotActive();
+    error Closed();
+    error InvalidAmount();
+
+    constructor(bytes32 _poolId, address _issuer, uint256 _unitPriceWei) {
+        require(_issuer != address(0) && _unitPriceWei > 0, "arg");
+        poolId = _poolId;
+        issuer = _issuer;
+        unitPriceWei = _unitPriceWei;
+        state = PoolState.Active;
+    }
+
+    modifier onlyActive() {
+        if (state != PoolState.Active) revert NotActive();
+        _;
+    }
+
+    function subscribe(uint256 units) external payable onlyActive {
+        if (units == 0) revert InvalidAmount();
+        uint256 cost = units * unitPriceWei;
+        require(msg.value == cost, "price");
+
+        holders[msg.sender].units += units;
+        totalUnitsSold += units;
+
+        emit Subscribed(msg.sender, units, msg.value);
+    }
+
+    /// @dev UMKM menyetor profit pool (ETH) untuk sebuah epoch
+    function reportProfit() external payable onlyActive {
+        require(msg.sender == issuer, "issuer");
+        require(msg.value > 0, "zero");
+        currentEpoch += 1;
+        profitAtEpoch[currentEpoch] = msg.value;
+        totalProfitReported += msg.value;
+        emit ProfitReported(currentEpoch, msg.value);
+    }
+
+    /// @dev Klaim semua dividen yang belum diklaim
+    function claimDividends() external {
+        Holder storage h = holders[msg.sender];
+        require(h.units > 0, "no units");
+        uint256 start = h.lastClaimedEpoch + 1;
+        uint256 end = currentEpoch;
+        if (start > end) revert InvalidAmount();
+
+        uint256 due;
+        for (uint256 e = start; e <= end; e++) {
+            uint256 poolProfit = profitAtEpoch[e];
+            if (poolProfit == 0) continue;
+            // pro-rata
+            due += (poolProfit * h.units) / totalUnitsSold;
+        }
+        h.lastClaimedEpoch = end;
+
+        if (due > 0) {
+            SafeTransferLib.safeTransferETH(msg.sender, due);
+        }
+        emit DividendClaimed(msg.sender, due);
+    }
+
+    function closePool() external onlyOwner {
+        state = PoolState.Closed;
+    }
+}
+
+/* ------------------------------------------------------------
+   ========== Governance (DAO 1 GFI = 1 vote) ==========
+   - Sederhana: proposal, vote, execute
+-------------------------------------------------------------*/
+contract Governance is Ownable {
+    GFIToken public immutable gfi;
+    uint256 public constant QUORUM_BPS = 2000; // 20% supply untuk contoh
+
+    enum ProposalState { Pending, Active, Succeeded, Executed, Defeated }
+    struct Proposal {
+        uint256 id;
+        address proposer;
+        string  description;
+        uint64  startTime;
+        uint64  endTime;
+        uint256 forVotes;
+        uint256 againstVotes;
+        ProposalState state;
+        address target;  // kontrak target eksekusi (contoh set fee dst)
+        bytes   callData; // data panggilan
+    }
+
+    mapping(uint256 => Proposal) public proposals;
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
+    uint256 public proposalCount;
+
+    event ProposalCreated(uint256 id, address proposer, string description);
+    event Voted(uint256 id, address voter, bool support, uint256 weight);
+    event Executed(uint256 id);
+
+    constructor(address _gfi) {
+        require(_gfi != address(0), "zero");
+        gfi = GFIToken(_gfi);
+    }
+
+    function createProposal(
+        string memory description,
+        address target,
+        bytes memory callData,
+        uint64 votingDelay,
+        uint64 votingPeriod
+    ) external returns (uint256 id) {
+        require(target != address(0), "target");
+        id = ++proposalCount;
+        proposals[id] = Proposal({
+            id: id,
+            proposer: msg.sender,
+            description: description,
+            startTime: uint64(block.timestamp + votingDelay),
+            endTime:   uint64(block.timestamp + votingDelay + votingPeriod),
+            forVotes: 0,
+            againstVotes: 0,
+            state: ProposalState.Pending,
+            target: target,
+            callData: callData
+        });
+        emit ProposalCreated(id, msg.sender, description);
+    }
+
+    function _state(uint256 id) internal view returns (ProposalState) {
+        Proposal storage p = proposals[id];
+        if (p.state == ProposalState.Executed) return ProposalState.Executed;
+        if (block.timestamp < p.startTime) return ProposalState.Pending;
+        if (block.timestamp <= p.endTime) return ProposalState.Active;
+
+        // setelah periode selesai:
+        uint256 supply = gfi.totalSupply();
+        bool quorum = ((p.forVotes + p.againstVotes) * 10_000 / supply) >= QUORUM_BPS;
+        if (!quorum) return ProposalState.Defeated;
+        return (p.forVotes > p.againstVotes) ? ProposalState.Succeeded : ProposalState.Defeated;
+    }
+
+    function state(uint256 id) external view returns (ProposalState) {
+        return _state(id);
+    }
+
+    function vote(uint256 id, bool support) external {
+        Proposal storage p = proposals[id];
+        ProposalState st = _state(id);
+        require(st == ProposalState.Active, "not active");
+        require(!hasVoted[id][msg.sender], "voted");
+        hasVoted[id][msg.sender] = true;
+
+        uint256 weight = gfi.balanceOf(msg.sender); // sederhana (tanpa snapshot)
+        require(weight > 0, "no GFI");
+        if (support) p.forVotes += weight; else p.againstVotes += weight;
+
+        emit Voted(id, msg.sender, support, weight);
+    }
+
+    function execute(uint256 id) external {
+        Proposal storage p = proposals[id];
+        require(_state(id) == ProposalState.Succeeded, "not passed");
+        require(p.state != ProposalState.Executed, "done");
+
+        // eksekusi panggilan ke target
+        (bool ok, ) = p.target.call(p.callData);
+        require(ok, "call fail");
+
+        p.state = ProposalState.Executed;
+        emit Executed(id);
+    }
+}
+
+/* ------------------------------------------------------------
+   ========== TreasuryMultiSig (Multi-signature Wallet) ==========
+   - Signers menyetujui transaksi; bila kuorum, dieksekusi
+-------------------------------------------------------------*/
+contract TreasuryMultiSig is Ownable {
+    using SafeTransferLib for address;
+
+    struct Tx {
+        address payable to;
+        uint256 value;
+        bytes   data;
+        bool    executed;
+        uint256 approvals;
+    }
+
+    mapping(address => bool) public isSigner;
+    address[] public signerList;
+    uint256 public required; // jumlah minimal tanda tangan
+    Tx[] public txs;
+    mapping(uint256 => mapping(address => bool)) public approvedBy;
+
+    event Deposit(address indexed from, uint256 amount);
+    event TxSubmitted(uint256 indexed id, address indexed to, uint256 value);
+    event Approved(uint256 indexed id, address indexed signer);
+    event Executed(uint256 indexed id);
+
+    modifier onlySigner() {
+        require(isSigner[msg.sender], "not signer"); _;
+    }
+
+    constructor(address[] memory _signers, uint256 _required) {
+        require(_signers.length >= 2 && _required > 0 && _required <= _signers.length, "param");
+        for (uint256 i = 0; i < _signers.length; i++) {
+            address s = _signers[i];
+            require(s != address(0) && !isSigner[s], "dup/zero");
+            isSigner[s] = true; signerList.push(s);
+        }
+        required = _required;
+    }
+
+    receive() external payable { emit Deposit(msg.sender, msg.value); }
+
+    function submitTx(address payable to, uint256 value, bytes calldata data) external onlySigner returns (uint256 id) {
+        txs.push(Tx({to: to, value: value, data: data, executed: false, approvals: 0}));
+        id = txs.length - 1;
+        emit TxSubmitted(id, to, value);
+    }
+
+    function approveTx(uint256 id) external onlySigner {
+        Tx storage t = txs[id];
+        require(!t.executed, "executed");
+        require(!approvedBy[id][msg.sender], "approved");
+        approvedBy[id][msg.sender] = true;
+        t.approvals += 1;
+        emit Approved(id, msg.sender);
+    }
+
+    function executeTx(uint256 id) external onlySigner {
+        Tx storage t = txs[id];
+        require(!t.executed, "executed");
+        require(t.approvals >= required, "need approvals");
+        t.executed = true;
+
+        (bool ok, ) = t.to.call{value: t.value}(t.data);
+        require(ok, "exec fail");
+        emit Executed(id);
+    }
+
+    // Getter tambahan
+    function signerCount() external view returns (uint256) { return signerList.length; }
+    function txCount() external view returns (uint256) { return txs.length; }
+}
+
+/* ------------------------------------------------------------
+   ========== SecondaryMarket (opsional ringkas) ==========
+   - Listing token virtual (ID proyek) dan harga, sederhana
+   - Diintegrasikan off-chain / front-end sebagai bukti konsep
+-------------------------------------------------------------*/
+contract SecondaryMarket is Ownable {
+    struct Listing {
+        address seller;
+        bytes32 assetId; // mis: id proyek/ekuitas
+        uint256 units;   // unit kepemilikan
+        uint256 priceWei;
+        bool active;
+    }
+
+    mapping(uint256 => Listing) public listings;
+    uint256 public listingCount;
+
+    event Listed(uint256 id, address seller, bytes32 assetId, uint256 units, uint256 priceWei);
+    event Purchased(uint256 id, address buyer, uint256 units, uint256 paid);
+    event Cancelled(uint256 id);
+
+    error NotActive();
+    error Invalid();
+
+    function list(bytes32 assetId, uint256 units, uint256 priceWei) external returns (uint256 id) {
+        if (units == 0 || priceWei == 0) revert Invalid();
+        id = ++listingCount;
+        listings[id] = Listing({seller: msg.sender, assetId: assetId, units: units, priceWei: priceWei, active: true});
+        emit Listed(id, msg.sender, assetId, units, priceWei);
+    }
+
+    function buy(uint256 id) external payable {
+        Listing storage l = listings[id];
+        if (!l.active) revert NotActive();
+        require(msg.value == l.priceWei, "price");
+
+        l.active = false;
+        // transfer ETH ke seller
+        (bool ok,) = l.seller.call{value: msg.value}("");
+        require(ok, "pay");
+        emit Purchased(id, msg.sender, l.units, msg.value);
+        // catatan: perpindahan kepemilikan unit dicatat off-chain / kontrak lain.
+    }
+
+    function cancel(uint256 id) external {
+        Listing storage l = listings[id];
+        require(msg.sender == l.seller, "seller");
+        l.active = false;
+        emit Cancelled(id);
+    }
+}
+
